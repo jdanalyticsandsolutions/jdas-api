@@ -6,30 +6,56 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
+# -------------------------
+# Env & constants
+# -------------------------
 load_dotenv()
 
-TENANT_ID = os.getenv("TENANT_ID")
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-DATAVERSE_URL = os.getenv("DATAVERSE_URL")  # e.g., https://yourorg.crm.dynamics.com
+TENANT_ID    = os.getenv("TENANT_ID")
+CLIENT_ID    = os.getenv("CLIENT_ID")
+CLIENT_SECRET= os.getenv("CLIENT_SECRET")
+DATAVERSE_URL= os.getenv("DATAVERSE_URL")  # e.g., https://yourorg.crm.dynamics.com
 
 if not all([TENANT_ID, CLIENT_ID, CLIENT_SECRET, DATAVERSE_URL]):
     raise RuntimeError("Missing env vars: TENANT_ID, CLIENT_ID, CLIENT_SECRET, DATAVERSE_URL")
 
 TOKEN_URL = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-SCOPE = f"{DATAVERSE_URL}/.default"
+SCOPE     = f"{DATAVERSE_URL}/.default"
 
-app = FastAPI(title="JDAS Dataverse API")
+# Optional: allow specific origins in prod; "*" is simplest while testing
+ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*").split(",")
 
-# CORS for your dashboard/Wix
+# -------------------------
+# FastAPI app
+# -------------------------
+app = FastAPI(title="JDAS Dataverse API", version="0.1.0")
+
+# CORS for Wix / embedded dashboards
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later
+    allow_origins=ALLOW_ORIGINS if ALLOW_ORIGINS != ["*"] else ["*"],
+    allow_credentials=False,        # keep False when using ["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------------
+# Health & root info (added)
+# -------------------------
+@app.get("/", summary="Service info")
+def root_info():
+    return {"service": "JDAS Dataverse API", "docs": "/docs", "health": "/health"}
+
+@app.get("/health", summary="Simple health check")
+def health_root():
+    return {"ok": True}
+
+@app.get("/api/health", summary="Health under /api")
+def health_api():
+    return {"ok": True}
 
 # -------------------------
 # AUTH with expiry + retry
@@ -86,12 +112,15 @@ async def dv_paged_get(path: str) -> List[dict]:
 
     while True:
         r = await _run(next_url, headers)
+
+        # If token expired, refresh once and retry same URL
         if r.status_code == 401:
             token = await fetch_access_token()
             headers = build_headers(token)
             r = await _run(next_url, headers)
 
         if r.status_code != 200:
+            # Bubble full Dataverse error up for debugging
             raise HTTPException(r.status_code, r.text)
 
         data = r.json()
@@ -159,8 +188,8 @@ TABLES = [
 # -------------------------
 def make_handler(entity_set: str, cols: List[str], keys: List[str], default_order: Optional[str]):
     async def handler(
-        top: int = Query(5000, ge=1, le=50000),
-        orderby: Optional[str] = Query(None),
+        top: int = Query(5000, ge=1, le=50000, description="$top limit"),
+        orderby: Optional[str] = Query(None, description="Override $orderby"),
     ):
         query = build_select(entity_set, cols, orderby or default_order, top=top)
         rows = await dv_paged_get(query)
@@ -170,7 +199,8 @@ def make_handler(entity_set: str, cols: List[str], keys: List[str], default_orde
             for c, k in zip(cols, keys):
                 item[k] = r.get(c)
             shaped.append(item)
-        return shaped
+        # Explicit JSONResponse avoids any content-type surprises
+        return JSONResponse(content=shaped)
     return handler
 
 for cfg in TABLES:
@@ -179,9 +209,9 @@ for cfg in TABLES:
     )
 
 # -------------------------
-# Utility
+# Utility endpoints
 # -------------------------
-@app.get("/api/metadata")
+@app.get("/api/metadata", summary="List available resources")
 async def list_resources():
     return [
         {"name": t["name"], "path": t["path"], "entity_set": t["entity_set"], "columns": t["columns"]}
